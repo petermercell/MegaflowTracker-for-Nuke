@@ -1,0 +1,324 @@
+# ============================================================================
+# CMakeLists.txt  —  MegaFlowSolve   *** WINDOWS / NUKE 17.1 build ***
+#                    (Nuke 17.1v1 / libtorch 2.7.1 / CUDA 12.x / OpenCV, MSVC)
+#
+# Windows port of the Linux CMakeLists.txt. Same structure — a static
+# megaflow_core, the MegaFlowSolve Nuke plugin, and the optional mf_solve CLI —
+# with the parts that cannot cross over:
+#
+#  1. LIBTORCH.  Linux links Nuke's own libtorch*.so for ABI parity. Foundry
+#     ships the torch DLLs on Windows but no import libraries, so this links a
+#     standalone libtorch 2.7.1 (Release, cu128) via -DTORCH_DIR. At runtime the
+#     loader resolves torch.dll / c10.dll etc. BY NAME and Nuke's own directory
+#     is on the search path, so inside Nuke the plugin binds to Nuke's already
+#     loaded copy. That only holds if TORCH_DIR is EXACTLY Nuke's version, 2.7.1.
+#     The five import libs are linked by hand rather than through libtorch's
+#     TorchConfig.cmake, which pulls in Caffe2's config: it wants
+#     CUDA::nvToolsExt (gone in CUDA >= 12.8) and re-resolves the toolkit via
+#     legacy FindCUDA, often landing on a different one.
+#
+#  2. /MD IS MANDATORY HERE. DDImage and libtorch are both /MD; a static CRT
+#     would give this plugin its own heap and crash on the first allocation that
+#     crosses the boundary. (The TensorRT BiRefNet plugins can use /MT because
+#     they link no /MD C++ library — this one cannot.)
+#
+#  3. NO RPATH, no dl/rt/pthread, and DDImage.lib instead of libDDImage.so.
+#
+# OpenCV is still needed: MegaFlowSolve.h includes opencv2/opencv.hpp and the
+# node uses cv::resize to match the CLI's resampling exactly. core + imgproc are
+# enough for the plugin; the CLI additionally needs imgcodecs for EXR. Point
+# CMake at your build with -DOpenCV_DIR=... (the folder holding
+# OpenCVConfig.cmake, e.g. C:/opencv/build or a vcpkg share/opencv4 dir).
+#
+# The 5 .pt engines are NOT embedded — the node takes an "Engines Dir" knob and
+# falls back to the MEGAFLOW_ENGINES environment variable, so nothing about the
+# engines is baked into this build.
+#
+# Configure / build:
+#   set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;%PATH%
+#   cd C:\Users\WORKSTATION\Downloads\MegaflowTracker-for-Nuke-main\MegaflowTracker-for-Nuke-main\LIBTORCH
+#   copy /y CMakeLists_WIN_171.txt CMakeLists.txt
+#   if exist build rd /s /q build 2>nul
+#   if not exist build md build
+#   cd /d build
+#   cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+#         -DNUKE_VERSION=17.1v1 ^
+#         -DTORCH_DIR=C:/libtorch-2.7.1 ^
+#         -DOpenCV_DIR=C:/opencv/build
+#   cmake --build .
+#   copy /y MegaFlowSolve.dll "%USERPROFILE%\.nuke\CPP171\"
+#
+# Also copy MegaFlowTracker.tcl and megaflow_cache.py from the repo root next to
+# the DLL, and put the engines folder somewhere the knob (or MEGAFLOW_ENGINES)
+# can point at.
+# ============================================================================
+cmake_minimum_required(VERSION 3.18)
+
+# Must be set BEFORE project() for the MSVC runtime selection to take effect.
+cmake_policy(SET CMP0091 NEW)
+
+project(megaflow_solve VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT WIN32)
+    message(FATAL_ERROR "This is the Windows CMakeLists — use the stock CMakeLists.txt on Linux.")
+endif()
+if(NOT MSVC)
+    message(FATAL_ERROR "This build requires MSVC (Visual Studio 2022 or later).")
+endif()
+if(MSVC_VERSION LESS 1930)
+    message(FATAL_ERROR "Visual Studio 2022 or later required (MSVC 19.30+), got ${MSVC_VERSION}")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# /MD — not negotiable, see note 2 above.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+
+set(SRC "${CMAKE_SOURCE_DIR}/src")
+if(NOT EXISTS "${SRC}/megaflow_solve.cpp")
+    message(FATAL_ERROR "src/ not found next to this CMakeLists (${SRC})")
+endif()
+
+option(MEGAFLOW_BUILD_CLI "Also build the mf_solve validation CLI (needs OpenCV imgcodecs + EXR)" OFF)
+
+#-------------------------------------------------------------------------------
+# Nuke NDK  (17.1)
+#-------------------------------------------------------------------------------
+set(NUKE_VERSION "17.1v1" CACHE STRING "Nuke version, e.g. 17.1v1")
+set(NUKE_ROOT "C:/Program Files/Nuke${NUKE_VERSION}" CACHE PATH "Nuke install")
+
+if(NOT EXISTS "${NUKE_ROOT}/include/DDImage/Iop.h")
+    message(FATAL_ERROR "Nuke NDK headers not found in ${NUKE_ROOT}/include\n"
+        "Pass -DNUKE_ROOT=... (or -DNUKE_VERSION=...).")
+endif()
+set(NUKE_INCLUDE "${NUKE_ROOT}/include")
+
+find_library(DDIMAGE_LIBRARY NAMES DDImage
+    PATHS "${NUKE_ROOT}" NO_DEFAULT_PATH REQUIRED)
+message(STATUS "Nuke root: ${NUKE_ROOT}")
+
+#-------------------------------------------------------------------------------
+# CUDA  (resolved BEFORE torch, so nothing else can pick a different toolkit)
+#-------------------------------------------------------------------------------
+if(NOT DEFINED CUDAToolkit_ROOT)
+    foreach(_v 12.8 12.9 12.6 12.4)
+        if(EXISTS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${_v}")
+            set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${_v}")
+            break()
+        endif()
+    endforeach()
+endif()
+find_package(CUDAToolkit REQUIRED)
+set(CUDA_TOOLKIT_ROOT_DIR "${CUDAToolkit_TARGET_DIR}" CACHE PATH "" FORCE)
+message(STATUS "CUDA found: ${CUDAToolkit_VERSION} (${CUDAToolkit_TARGET_DIR})")
+
+#-------------------------------------------------------------------------------
+# libtorch 2.7.1  (standalone; import libs linked by hand — see note 1)
+#-------------------------------------------------------------------------------
+set(TORCH_DIR "C:/libtorch-2.7.1" CACHE PATH "standalone libtorch 2.7.1 (Release, cu128)")
+if(NOT EXISTS "${TORCH_DIR}/include/torch/script.h")
+    message(FATAL_ERROR "torch/script.h not found in ${TORCH_DIR}/include\n"
+        "Set -DTORCH_DIR=C:/libtorch-2.7.1 (unzipped libtorch, Release + CUDA 12.8).")
+endif()
+
+set(TORCH_INCLUDE_DIRS
+    "${TORCH_DIR}/include"
+    "${TORCH_DIR}/include/torch/csrc/api/include")
+
+set(TORCH_LIBS "")
+foreach(_l torch torch_cpu torch_cuda c10 c10_cuda)
+    find_library(TORCH_LIB_${_l} NAMES ${_l}
+        PATHS "${TORCH_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+    list(APPEND TORCH_LIBS "${TORCH_LIB_${_l}}")
+endforeach()
+message(STATUS "libtorch: import libs from ${TORCH_DIR}/lib")
+
+file(GLOB _nuke_torch_dlls "${NUKE_ROOT}/torch*.dll" "${NUKE_ROOT}/c10*.dll")
+if(_nuke_torch_dlls)
+    message(STATUS "Nuke ships torch DLLs — inside Nuke the plugin binds to THOSE at "
+                   "runtime. ${TORCH_DIR} must be exactly the same version (2.7.1).")
+endif()
+
+#-------------------------------------------------------------------------------
+# OpenCV
+#-------------------------------------------------------------------------------
+# Look in the usual Windows locations first, so -DOpenCV_DIR is only needed for
+# a non-standard install. Any folder holding OpenCVConfig.cmake works.
+set(_ocv_candidates
+    "C:/opencv/build"
+    "C:/OpenCV414/opencv/build"
+    "C:/opencv/opencv/build"
+    "C:/opencv/build/x64/vc16/lib"
+    "C:/tools/opencv/build"
+    "C:/Program Files/opencv/build"
+    "C:/dev/opencv/build"
+    "C:/vcpkg/installed/x64-windows/share/opencv4"
+    "C:/vcpkg/installed/x64-windows/share/opencv"
+    "C:/src/vcpkg/installed/x64-windows/share/opencv4")
+
+if(NOT OpenCV_DIR)
+    foreach(_env OpenCV_DIR OPENCV_DIR)
+        if(DEFINED ENV{${_env}} AND NOT OpenCV_DIR)
+            set(OpenCV_DIR "$ENV{${_env}}")
+            message(STATUS "OpenCV_DIR taken from the ${_env} environment variable")
+        endif()
+    endforeach()
+endif()
+if(NOT OpenCV_DIR)
+    foreach(_d ${_ocv_candidates})
+        if(EXISTS "${_d}/OpenCVConfig.cmake")
+            set(OpenCV_DIR "${_d}")
+            message(STATUS "OpenCV found automatically at ${_d}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(MEGAFLOW_BUILD_CLI)
+    find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs)
+else()
+    find_package(OpenCV QUIET COMPONENTS core imgproc)
+endif()
+
+if(NOT OpenCV_FOUND)
+    string(REPLACE ";" "\n    " _ocv_tried "${_ocv_candidates}")
+    message(FATAL_ERROR
+        "OpenCV not found.\n"
+        "\n"
+        "MegaFlowSolve.h includes opencv2/opencv.hpp, and the node resizes with\n"
+        "cv::resize(INTER_LINEAR) specifically to stay byte-identical to the CLI,\n"
+        "so this dependency cannot simply be dropped.\n"
+        "\n"
+        "Looked for OpenCVConfig.cmake in:\n"
+        "    ${_ocv_tried}\n"
+        "\n"
+        "If OpenCV is installed elsewhere, point at the folder holding\n"
+        "OpenCVConfig.cmake:\n"
+        "    cmake .. -DOpenCV_DIR=D:/path/to/opencv/build\n"
+        "\n"
+        "If it is not installed: grab the prebuilt Windows release from\n"
+        "https://opencv.org/releases/ (opencv-4.x-windows.exe), extract it to\n"
+        "C:\\opencv, and reconfigure — C:/opencv/build is found automatically.\n"
+        "That build is dynamic /MD, which is what this plugin needs.")
+endif()
+message(STATUS "OpenCV ${OpenCV_VERSION}: ${OpenCV_DIR}")
+
+#-------------------------------------------------------------------------------
+# Common settings (mirrors mf_common from the Linux file)
+#-------------------------------------------------------------------------------
+set(COMMON_INCLUDES
+    ${SRC}
+    ${CMAKE_SOURCE_DIR}/include
+    ${TORCH_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS})
+
+function(mf_common tgt)
+    target_include_directories(${tgt} PRIVATE ${COMMON_INCLUDES})
+
+    target_compile_definitions(${tgt} PRIVATE
+        NOMINMAX                 # windows.h would otherwise eat std::min/std::max
+        WIN32_LEAN_AND_MEAN
+        _USE_MATH_DEFINES
+        _CRT_SECURE_NO_WARNINGS  # std::getenv & co.
+        _SCL_SECURE_NO_WARNINGS
+        _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+
+        # VS 17.10+ made std::mutex's ctor constexpr. Built that way, a /MD
+        # binary access-violates inside an msvcp140.dll older than 14.40 — and
+        # Nuke's own directory wins the DLL search (17.0v1 ships 14.36, 17.1v1
+        # ships 14.44). libtorch's headers use std::mutex all over, and /MD is
+        # mandatory here, so this one matters. Kept in both builds so a single
+        # binary works in either Nuke.
+        _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+
+    target_compile_options(${tgt} PRIVATE
+        /W3 /O2 /MP /bigobj /EHsc /permissive- /Zc:__cplusplus /nologo
+        /wd4251 /wd4267 /wd4244 /wd4275 /wd4305 /wd4996 /wd4018)
+endfunction()
+
+#-------------------------------------------------------------------------------
+# Reusable solve core (shared by the plugin and the CLI)
+#-------------------------------------------------------------------------------
+add_library(megaflow_core STATIC
+    ${SRC}/torch_engine.cpp
+    ${SRC}/megaflow_glue.cpp
+    ${SRC}/megaflow_solve.cpp
+    ${SRC}/megaflow_npz.cpp)
+target_link_libraries(megaflow_core PUBLIC ${TORCH_LIBS} CUDA::cudart)
+mf_common(megaflow_core)
+
+#-------------------------------------------------------------------------------
+# The Nuke plugin: MegaFlowSolve.dll
+#   cuda_utils.cpp compiles in here only — the node has the VRAM buttons.
+#-------------------------------------------------------------------------------
+if(NOT EXISTS "${SRC}/MegaFlowSolve.cpp")
+    message(FATAL_ERROR "src/MegaFlowSolve.cpp not found — nothing to build")
+endif()
+
+add_library(MegaFlowSolve SHARED
+    ${SRC}/MegaFlowSolve.cpp
+    ${SRC}/cuda_utils.cpp)
+
+target_include_directories(MegaFlowSolve PRIVATE ${NUKE_INCLUDE})
+target_link_libraries(MegaFlowSolve PRIVATE
+    megaflow_core
+    ${DDIMAGE_LIBRARY}
+    ${OpenCV_LIBS})
+mf_common(MegaFlowSolve)
+
+set_target_properties(MegaFlowSolve PROPERTIES
+    PREFIX ""
+    SUFFIX ".dll"
+    OUTPUT_NAME "MegaFlowSolve")
+
+#-------------------------------------------------------------------------------
+# Optional CLI / validation harness
+#-------------------------------------------------------------------------------
+if(MEGAFLOW_BUILD_CLI)
+    add_executable(mf_solve ${SRC}/mf_solve.cpp)
+    target_link_libraries(mf_solve PRIVATE megaflow_core ${OpenCV_LIBS})
+    mf_common(mf_solve)
+    message(STATUS "CLI: mf_solve ON — needs the torch DLLs and OpenCV DLLs on PATH,")
+    message(STATUS "     and OPENCV_IO_ENABLE_OPENEXR=1 in the environment for EXR input.")
+endif()
+
+#-------------------------------------------------------------------------------
+# Installation
+#-------------------------------------------------------------------------------
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/.nuke" CACHE PATH "Install path" FORCE)
+endif()
+
+install(TARGETS MegaFlowSolve RUNTIME DESTINATION . LIBRARY DESTINATION .)
+
+#-------------------------------------------------------------------------------
+# Summary
+#-------------------------------------------------------------------------------
+message(STATUS "")
+message(STATUS "==========================================")
+message(STATUS "MegaFlowSolve — Windows / Nuke 17.1")
+message(STATUS "==========================================")
+message(STATUS "  Nuke:          ${NUKE_ROOT}")
+message(STATUS "  Torch:         ${TORCH_DIR}  (2.7.1 — must match Nuke's)")
+message(STATUS "  CUDA:          ${CUDAToolkit_VERSION}")
+message(STATUS "  OpenCV:        ${OpenCV_VERSION} (${OpenCV_DIR})")
+message(STATUS "                 its DLL (opencv_world*.dll) must be on PATH when Nuke runs")
+message(STATUS "  DDImage:       ${DDIMAGE_LIBRARY}")
+message(STATUS "  Sources:       ${SRC}")
+message(STATUS "  Runtime:       DYNAMIC (/MD) — required with DDImage + libtorch")
+message(STATUS "  Node:          AI/MegaFlowSolve")
+message(STATUS "  Engines:       not embedded — 'Engines Dir' knob / MEGAFLOW_ENGINES")
+message(STATUS "  Output:        MegaFlowSolve.dll")
+if(MEGAFLOW_BUILD_CLI)
+message(STATUS "                 + mf_solve.exe")
+endif()
+message(STATUS "  Install:       ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "==========================================")
+message(STATUS "")
