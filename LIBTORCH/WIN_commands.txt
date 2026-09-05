@@ -1,0 +1,29 @@
+You will need download OpenCV 4.14.0 https://opencv.org/releases/ and copy opencv_world4xx.dl to C:\Program Files\Nuke17.1v1\
+
+
+set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;%PATH%
+cd C:\Users\WORKSTATION\Downloads\MegaflowTracker-for-Nuke-main\MegaflowTracker-for-Nuke-main\LIBTORCH
+copy /y CMakeLists_WIN_171.txt CMakeLists.txt
+if exist build rd /s /q build 2>nul
+if not exist build md build
+cd /d build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DNUKE_VERSION=17.1v1 ^
+      -DTORCH_DIR=C:/libtorch-2.7.1 ^
+      -DOpenCV_DIR=C:/OpenCV414/opencv/build
+cmake --build .
+copy /y MegaFlowSolve.dll "%USERPROFILE%\.nuke\CPP171\"
+
+
+set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;%PATH%
+cd C:\Users\WORKSTATION\Downloads\MegaflowTracker-for-Nuke-main\MegaflowTracker-for-Nuke-main\LIBTORCH
+copy /y CMakeLists_WIN_170.txt CMakeLists.txt
+if exist build rd /s /q build 2>nul
+if not exist build md build
+cd /d build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DNUKE_VERSION=17.0v1 ^
+      -DTORCH_DIR=C:/libtorch-2.7.1 ^
+      -DOpenCV_DIR=C:/OpenCV414/opencv/build
+cmake --build .
+copy /y MegaFlowSolve.dll "%USERPROFILE%\.nuke\CPP170\"
